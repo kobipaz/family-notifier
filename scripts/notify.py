@@ -1,13 +1,16 @@
 """Family to-do notifications — run on GitHub Actions, started every ~5 minutes from outside (workflow_dispatch).
-Only three kinds of alerts, all for the kids (FAMILY["kids"]):
- 1. A parent (admin) added a task to a kid's own list -> that kid gets it (several in one run -> one message)
+Only these alerts:
+ 1. A parent (admin) added a task to someone else's own list (a kid, or the other parent)
+                                                        -> that person gets it (several in one run -> one message)
  2. Activity (activities board) starts soon            -> the kid gets a reminder ~30 minutes before
  3. Exam tomorrow (exam board)                          -> the kid gets a reminder the evening before (from 17:00)
+ 4. Birthday tomorrow (birthdays board)                 -> everyone gets a reminder the evening before (from 18:00)
 Also: tasks in the recycle bin for more than 14 days are removed for good (no alert).
 Needs two secrets:
   FIREBASE_SA — the Firebase service-account JSON
   FAMILY      — the family settings JSON (names, kids, admins, app address); see README.md
-Optional FAMILY keys: "chug_before_min" (default 30), "exam_eve" (default "17:00"), "timezone" (default Asia/Jerusalem).
+Optional FAMILY keys: "chug_before_min" (default 30), "exam_eve" (default "17:00"), "bday_eve" (default "18:00"),
+"timezone" (default Asia/Jerusalem).
 This repository is public, so the logs never print names, task titles or ids — only counts."""
 import os, json, time, datetime
 from zoneinfo import ZoneInfo
@@ -24,8 +27,9 @@ ADMINS = set(FAM.get('admins', []))                    # parents
 KIDS = [k for k in FAM.get('kids', []) if k in NAMES]  # who gets alerts
 CHUG_BEFORE = int(FAM.get('chug_before_min', 30))
 EXAM_EVE = tuple(int(x) for x in FAM.get('exam_eve', '17:00').split(':'))
+BDAY_EVE = tuple(int(x) for x in FAM.get('bday_eve', '18:00').split(':'))
 SPECIAL = ('exam', 'chug', 'bday', 'shop', 'shopList', 'event')   # board items, not plain tasks
-SENT = {'new': 0, 'chug': 0, 'exam': 0, 'failed': 0, 'bin': 0}
+SENT = {'new': 0, 'chug': 0, 'exam': 0, 'bday': 0, 'failed': 0, 'bin': 0}
 
 firebase_admin.initialize_app(credentials.Certificate(json.loads(os.environ['FIREBASE_SA'])))
 db = firestore.client()
@@ -66,14 +70,14 @@ today = now.strftime('%Y-%m-%d')
 tomorrow = (now + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
 now_min = now.hour * 60 + now.minute
 
-# ---------- 1. a parent added a task to a kid's list ----------
+# ---------- 1. a parent added a task to someone else's list ----------
 last = state.get('lastNew') or now_ms          # first run: start from now (no flood of old tasks)
 per_kid = {}
 for d in db.collection('tasks').where('createdAt', '>', last).stream():
     t = d.to_dict()
     if t.get('archived') or t.get('done') or t.get('deleted') or any(t.get(k) for k in SPECIAL):
         continue
-    if t.get('createdBy') in ADMINS and t.get('list') in KIDS and t.get('list') != t.get('createdBy'):
+    if t.get('createdBy') in ADMINS and t.get('list') in NAMES and t.get('list') != t.get('createdBy'):
         per_kid.setdefault(t['list'], []).append(t)
 for kid, ts in per_kid.items():
     ts.sort(key=lambda x: x.get('createdAt', 0))
@@ -123,6 +127,18 @@ if (now.hour, now.minute) >= EXAM_EVE and now.hour < 22 and state.get('examEve')
     for kid, ts in per_kid.items():
         SENT['exam'] += push(kid, '📝 מחר מבחן!', '\n'.join('• ' + (t.get('subject') or t.get('title', '')) for t in ts) + '\nבהצלחה 🍀')
     state['examEve'] = today
+
+# ---------- 4. birthday tomorrow (the evening before) -> everyone ----------
+if (now.hour, now.minute) >= BDAY_EVE and now.hour < 22 and state.get('bdayEve') != today:
+    md = (now + datetime.timedelta(days=1)).strftime('%m-%d')
+    for d in db.collection('tasks').where('bday', '==', True).stream():
+        b = d.to_dict()
+        if b.get('md') != md:
+            continue
+        age = (now.year + (1 if md == '01-01' else 0) - int(b['year'])) if str(b.get('year') or '').isdigit() else 0
+        for person in NAMES:
+            SENT['bday'] += push(person, f'🎂 מחר יום ההולדת של {b.get("title", "")}!', (f'{age} שנים · ' if age else '') + 'לא לשכוח לאחל מזל טוב 🎉')
+    state['bdayEve'] = today
 
 # ---------- recycle bin: tasks deleted more than 14 days ago are removed for good ----------
 cutoff = now_ms - 14 * 86400000
